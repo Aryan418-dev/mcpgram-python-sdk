@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcpgram"
+version = "0.1.0"
+description = "Official Python SDK for MCPGRAM -- one client for native connectors and external MCP servers, with LangGraph and CrewAI adapters."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "httpx>=0.24",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+langgraph = ["langchain-core>=0.2"]
+crewai = ["crewai>=0.30"]
+all = ["langchain-core>=0.2", "crewai>=0.30"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcpgram"]
