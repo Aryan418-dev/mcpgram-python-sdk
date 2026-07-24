@@ -9,12 +9,18 @@ Usage:
     cw.crewai_tools # actual crewai.tools.BaseTool instances, only populated
                      # if the `crewai` package is installed
 
-CrewAI tools are normally pydantic-backed Python classes; crewai_tools
-dynamically builds one BaseTool subclass per MCPGRAM tool, with a `_run`
-that calls back into /api/v1/execute the same way every other adapter does.
+CrewAI tools are normally pydantic-backed Python classes; crewai_tools builds
+one BaseTool *instance* per MCPGRAM tool from a single shared subclass (not
+one dynamic class per tool -- BaseTool's own fields are pydantic v2 fields,
+and overriding them via a bare `type(...)` namespace without annotations
+raises PydanticUserError, since pydantic treats that as an invalid field
+override rather than a plain attribute set). The tool_id and executor are
+stored as private attributes instead, bound per instance in __init__.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
@@ -30,12 +36,34 @@ def _stringify_output(output: Any) -> str:
         return output
     if output is None:
         return ""
-    import json
-
     try:
         return json.dumps(output, indent=2, default=str)
     except TypeError:
         return str(output)
+
+
+def _run_sync(call_fn: CallFn, tool_id: str, kwargs: dict[str, Any]) -> str:
+    # CrewAI's BaseTool._run is synchronous; MCPGRAM's Platform.call is
+    # async, so bridge with a dedicated thread when a loop is already
+    # running (e.g. an async CrewAI kickoff), rather than asyncio.run()
+    # which raises in that case.
+    try:
+        loop = asyncio.get_event_loop()
+        running = loop.is_running()
+    except RuntimeError:
+        running = False
+
+    if running:
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            result: ExecuteResult = pool.submit(asyncio.run, call_fn(tool_id, kwargs)).result()
+    else:
+        result = asyncio.run(call_fn(tool_id, kwargs))
+
+    if result.status == "error":
+        return f"Error: {result.error or 'Tool execution failed with no error message.'}"
+    return _stringify_output(result.output)
 
 
 @dataclass
@@ -47,50 +75,34 @@ class CrewAIGateway:
 def _try_build_crewai_tools(flat_tools: list[ToolDefinition], call_fn: CallFn) -> Optional[list[Any]]:
     try:
         from crewai.tools import BaseTool
+        from pydantic import PrivateAttr
     except ImportError:
         return None
 
-    import asyncio
+    class _MCPGramCrewAITool(BaseTool):
+        _tool_id: str = PrivateAttr()
+        _call_fn: Any = PrivateAttr()
+
+        def __init__(self, *, tool_id: str, call_fn: CallFn, **kwargs: Any):
+            super().__init__(**kwargs)
+            self._tool_id = tool_id
+            self._call_fn = call_fn
+
+        def _run(self, **kwargs: Any) -> str:
+            return _run_sync(self._call_fn, self._tool_id, kwargs)
 
     built: list[Any] = []
     for tool in flat_tools:
         args_model = schema_to_pydantic_model(tool.name, tool.input_schema or {"type": "object", "properties": {}})
-
-        def _make_run(tool_id: str):
-            def _run(**kwargs: Any) -> str:
-                # CrewAI's BaseTool._run is synchronous; MCPGRAM's Platform.call
-                # is async, so bridge with a dedicated event loop rather than
-                # asyncio.run() (which breaks if a crew is already running
-                # inside its own loop, e.g. an async CrewAI kickoff).
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        import concurrent.futures
-
-                        with concurrent.futures.ThreadPoolExecutor() as pool:
-                            result: ExecuteResult = pool.submit(asyncio.run, call_fn(tool_id, kwargs)).result()
-                    else:
-                        result = loop.run_until_complete(call_fn(tool_id, kwargs))
-                except RuntimeError:
-                    result = asyncio.run(call_fn(tool_id, kwargs))
-
-                if result.status == "error":
-                    return f"Error: {result.error or 'Tool execution failed with no error message.'}"
-                return _stringify_output(result.output)
-
-            return _run
-
-        tool_cls = type(
-            f"MCPGRAM{tool.name.title().replace('_', '')}Tool",
-            (BaseTool,),
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "args_schema": args_model,
-                "_run": staticmethod(_make_run(tool.tool_id)),
-            },
+        built.append(
+            _MCPGramCrewAITool(
+                name=tool.name,
+                description=tool.description,
+                args_schema=args_model,
+                tool_id=tool.tool_id,
+                call_fn=call_fn,
+            )
         )
-        built.append(tool_cls())
     return built
 
 
